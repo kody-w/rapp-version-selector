@@ -15,10 +15,11 @@ Swaps `~/.brainstem/src` for the mirrored tree (old tree kept as a timestamped
 backup), reuses the existing venv, restarts the server, and verifies the
 running version. The pin is recorded in `~/.brainstem/.pinned-version`.
 
-**Heads-up:** pinning swaps the whole source tree, so custom agents in
-`agents/` go with the backup. Restore them from
-[rapp-vault](https://github.com/kody-w/rapp-vault) (`restore.sh`) after
-pinning — snapshot first.
+**The pin changes the kernel, never the estate:** auth/config, your custom
+agents (anything in `agents/` the mirror doesn't ship), and memories are
+carried across automatically. Only stock files change. A pre-pin
+[rapp-vault](https://github.com/kody-w/rapp-vault) snapshot is still good
+practice — it's the cross-machine restore path.
 
 **Un-pin** (back to latest): just re-run the public installer —
 `curl -fsSL https://kody-w.github.io/rapp-installer/install.sh | bash`
