@@ -1,5 +1,5 @@
 {
-  "latest": "v0.6.6",
+  "latest": "v0.6.7",
   "versions": {
     "v0.6.5": {
       "source_commit": "5d40873",
@@ -10,6 +10,11 @@
       "source_commit": "cc699cd",
       "mirrored_at": "2026-07-07T23:14:53Z",
       "notes": "CI guard for stale docs/ Pages mirrors (#19), Haiku doc-drift fix in /models/set (#20); includes #18 docs/install.ps1 mirror"
+    },
+    "v0.6.7": {
+      "source_commit": "99f347a",
+      "mirrored_at": "2026-07-07T23:42:33Z",
+      "notes": ""
     }
   }
 }
