@@ -25,10 +25,10 @@ rsync -a --exclude '.git' --exclude '__pycache__' \
     "$REPO_DIR/versions/$V/"
 
 commit=$(git -C "$GRAIL" rev-parse --short HEAD 2>/dev/null || echo unknown)
+cd "$REPO_DIR"   # versions.json path below is repo-relative
 python3 - "$V" "$commit" <<'PY'
 import json, sys, datetime, pathlib
 v, commit = sys.argv[1], sys.argv[2]
-p = pathlib.Path(__file__).parent if '__file__' in dir() else pathlib.Path('.')
 f = pathlib.Path('versions.json')
 d = json.loads(f.read_text())
 d['versions'][v] = {

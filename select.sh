@@ -45,6 +45,25 @@ if [ -n "$OLD_SRC" ]; then
     for f in .copilot_token .copilot_session .env .brainstem_model; do
         [ -f "$OLD_SRC/rapp_brainstem/$f" ] && cp "$OLD_SRC/rapp_brainstem/$f" "$BH/src/rapp_brainstem/$f"
     done
+    # Carry USER agents too (#3): anything in agents/ that the mirror doesn't
+    # ship is the user's, not the version's. Same principle as auth — the pin
+    # changes the kernel, never the estate. Stock files are never overwritten,
+    # so version-specific stock agents stay exactly as mirrored.
+    carried=0
+    for a in "$OLD_SRC"/rapp_brainstem/agents/*_agent.py; do
+        [ -f "$a" ] || continue
+        base=$(basename "$a")
+        if [ ! -f "$BH/src/rapp_brainstem/agents/$base" ]; then
+            cp "$a" "$BH/src/rapp_brainstem/agents/$base"
+            carried=$((carried + 1))
+        fi
+    done
+    # Memories are estate, not kernel — carry .brainstem_data when the mirror
+    # tree starts empty (it always does).
+    if [ -d "$OLD_SRC/rapp_brainstem/.brainstem_data" ] && [ ! -d "$BH/src/rapp_brainstem/.brainstem_data" ]; then
+        cp -R "$OLD_SRC/rapp_brainstem/.brainstem_data" "$BH/src/rapp_brainstem/"
+    fi
+    echo "Carried across the pin: auth/config + $carried user agent(s) + memories"
 fi
 
 # Ensure a venv (reuse if present)
