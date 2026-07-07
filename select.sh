@@ -29,12 +29,23 @@ pids=$(lsof -ti:7071 2>/dev/null || true)
 [ -n "$pids" ] && { echo "$pids" | xargs kill 2>/dev/null || true; sleep 1; }
 
 # Swap the source tree (backup the old one), keep the venv
+OLD_SRC=""
 if [ -d "$BH/src" ]; then
-    mv "$BH/src" "$BH/src-before-pin-$(date +%Y%m%d-%H%M%S)"
+    OLD_SRC="$BH/src-before-pin-$(date +%Y%m%d-%H%M%S)"
+    mv "$BH/src" "$OLD_SRC"
 fi
 mkdir -p "$BH/src"
 rsync -a "$SRC/" "$BH/src/"
 echo "$V" > "$BH/.pinned-version"
+
+# Carry auth + local config across the pin — these live in the src tree but
+# belong to the DEVICE, not the version. Without this the pinned server comes
+# up unauthenticated and silently falls back to gpt-4o.
+if [ -n "$OLD_SRC" ]; then
+    for f in .copilot_token .copilot_session .env .brainstem_model; do
+        [ -f "$OLD_SRC/rapp_brainstem/$f" ] && cp "$OLD_SRC/rapp_brainstem/$f" "$BH/src/rapp_brainstem/$f"
+    done
+fi
 
 # Ensure a venv (reuse if present)
 if [ ! -x "$BH/venv/bin/python" ]; then
