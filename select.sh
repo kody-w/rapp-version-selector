@@ -9,7 +9,7 @@
 #   curl -fsSL https://raw.githubusercontent.com/kody-w/rapp-version-selector/main/select.sh | bash -s v0.6.5
 
 set -euo pipefail
-V="${1:?Usage: select.sh vX.Y.Z — see versions.json for what's mirrored}"
+V="${1:?Usage: select.sh vX.Y.Z — see versions.json for mirrored versions}"
 BH="$HOME/.brainstem"
 TARBALL_URL="https://codeload.github.com/kody-w/rapp-version-selector/tar.gz/refs/heads/main"
 
