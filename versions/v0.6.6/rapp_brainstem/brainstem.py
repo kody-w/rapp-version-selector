@@ -1,0 +1,2024 @@
+"""
+RAPP Brainstem — minimal local AI agent endpoint.
+Only dependency: a GitHub account with Copilot access.
+
+Uses the GitHub Copilot API directly.
+No API keys needed — just `gh auth login`.
+
+Usage:
+    ./start.sh
+    # or: python brainstem.py
+
+POST /chat    { user_input, conversation_history?, session_id? }
+GET  /health  Status, model, loaded agents, token state
+"""
+
+import os
+import sys
+import json
+import re
+import uuid
+import glob
+import time
+import threading
+import importlib.util
+import subprocess
+import traceback
+from datetime import datetime, timezone
+
+import requests
+from flask import Flask, request, jsonify, send_from_directory
+from flask_cors import CORS
+from dotenv import load_dotenv
+
+# Banner/log lines contain emoji and em-dashes. On Windows a cp1252 console (or any
+# redirected/piped stdout) raises UnicodeEncodeError on the first such print and takes
+# the server down at startup. Re-encode stdout/stderr as UTF-8, replacing anything the
+# target can't represent, so a print can never crash the process. No-op where already
+# UTF-8 or where the stream predates reconfigure().
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+load_dotenv()
+
+# No static route: Flask's default static handler would otherwise serve the whole
+# brainstem directory (including .env with GITHUB_TOKEN, .copilot_token, etc.) over
+# the network at /<dirname>/<file>. index.html is served explicitly by the / route.
+app = Flask(__name__, static_folder=None)
+CORS(app)
+
+# ── Config ────────────────────────────────────────────────────────────────────
+
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+def _resolve_under_base(value, default_name):
+    """Resolve a SOUL_PATH/AGENTS_PATH setting. A relative value (the shipped
+    .env.example uses ./soul.md, ./agents) resolves against the brainstem dir, not
+    the current working directory — so the server finds its soul and agents no matter
+    where it's launched from (CLI wrapper, cron, a different cwd)."""
+    if not value:
+        return os.path.join(_BASE_DIR, default_name)
+    return value if os.path.isabs(value) else os.path.join(_BASE_DIR, value)
+
+SOUL_PATH   = _resolve_under_base(os.getenv("SOUL_PATH"),   "soul.md")
+AGENTS_PATH = _resolve_under_base(os.getenv("AGENTS_PATH"), "agents")
+# Model selection precedence (see _auto_select_default_model below):
+#   1. .brainstem_model — a model picked in the UI, persisted across restarts
+#   2. GITHUB_MODEL pinned to a specific id (anything other than "auto")
+#   3. GITHUB_MODEL="auto" / unset -> highest Claude Haiku the account can use
+#      (fastest responses), falling back to the highest Sonnet
+#   4. gpt-4o safety net (also the call_copilot fallback)
+MODEL_ENV    = (os.getenv("GITHUB_MODEL") or "").strip()
+MODEL_PINNED = bool(MODEL_ENV) and MODEL_ENV.lower() != "auto"
+MODEL        = MODEL_ENV if MODEL_PINNED else "gpt-4o"  # provisional; resolved below
+_SAFETY_NET_MODEL = "gpt-4o"
+# A blank PORT= in .env yields "" — int("") raises at import and the server never
+# starts. Fall back to the default for anything non-numeric.
+try:
+    PORT = int((os.getenv("PORT") or "7071").strip())
+except ValueError:
+    print("[brainstem] Invalid PORT in environment — using default 7071")
+    PORT = 7071
+VOICE_MODE  = os.getenv("VOICE_MODE", "false").lower() == "true"
+VOICE_ZIP_PW = os.getenv("VOICE_ZIP_PASSWORD", "").encode() or None
+
+_version_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "VERSION")
+VERSION = open(_version_file, encoding="utf-8").read().strip() if os.path.exists(_version_file) else "0.0.0"
+
+COPILOT_TOKEN_URL = "https://api.github.com/copilot_internal/v2/token"
+
+
+def _atomic_write_json(path, data):
+    """Write JSON to `path` atomically: serialize to a temp file in the same
+    directory, then os.replace() it into place. A crash or concurrent reader never
+    sees a half-written file, so state files (tokens, caches, memories) can't be
+    truncated into corruption. os.replace is atomic on both POSIX and Windows.
+    Raises on failure so callers can decide how loud to be."""
+    directory = os.path.dirname(os.path.abspath(path))
+    os.makedirs(directory, exist_ok=True)
+    tmp = f"{path}.{os.getpid()}.tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, default=str)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    finally:
+        # If os.replace succeeded the temp is gone; this only cleans up on failure.
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+AVAILABLE_MODELS = [
+    {"id": "gpt-4.1",         "name": "GPT-4.1"},
+    {"id": "gpt-4o",          "name": "GPT-4o"},
+    {"id": "gpt-4o-mini",     "name": "GPT-4o Mini"},
+    {"id": "claude-sonnet-4", "name": "Claude Sonnet 4"},
+    {"id": "gpt-4",           "name": "GPT-4"},
+    {"id": "gpt-3.5-turbo",   "name": "GPT-3.5 Turbo"},
+]
+
+# Models that don't support OpenAI-style tool_choice parameter
+_NO_TOOL_CHOICE_MODELS = set()
+_models_fetched = False
+_default_model_selected = False  # one-shot guard for _auto_select_default_model
+
+# ── Sticky model persistence ──────────────────────────────────────────────────
+# A model picked in the web UI is remembered here so it stays the default across
+# browser refreshes, server restarts, and for non-browser clients hitting /chat.
+_model_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".brainstem_model")
+
+def _load_sticky_model():
+    """Return the user's last manually-selected model id (persisted), or None."""
+    try:
+        if os.path.exists(_model_file):
+            with open(_model_file, encoding="utf-8") as f:
+                data = json.load(f)
+            mid = (data.get("model") or "").strip() if isinstance(data, dict) else ""
+            return mid or None
+    except Exception:
+        pass
+    return None
+
+def _save_sticky_model(model_id):
+    """Persist a manual model choice so it stays the default across restarts."""
+    try:
+        _atomic_write_json(_model_file, {"model": model_id})
+    except Exception as e:
+        print(f"[brainstem] Could not persist model choice: {e}")
+
+def _clear_sticky_model():
+    """Forget the persisted pick (return to the env / auto-select default)."""
+    try:
+        if os.path.exists(_model_file):
+            os.remove(_model_file)
+    except Exception:
+        pass
+
+# A persisted manual pick wins over the env default resolved above.
+MODEL = _load_sticky_model() or MODEL
+
+# ── Claude model auto-selection ─────────────────────────────────────────────────────
+# Anthropic "reasoning" variant markers Copilot appends (e.g.
+# claude-3.7-sonnet-thought). Stripped so a reasoning variant ranks identically
+# to its base generation; _auto_select_default_model breaks the tie toward base.
+_REASONING_SUFFIXES = ("thought", "thinking", "reasoning")
+
+_CLAUDE_FAMILIES = ("sonnet", "haiku", "opus")
+
+def _claude_rank(model_id, model_name="", family="sonnet"):
+    """Return a comparable (major, minor) version tuple for a Claude model of
+    the given family (sonnet / haiku / opus), or None if it isn't one.
+
+    Handles both Copilot naming shapes:
+      version-before-name:  claude-3.5-sonnet, claude-3-5-haiku-20241022, claude-3.7-sonnet
+      version-after-name:   claude-sonnet-4, claude-haiku-4.5, claude-sonnet-4-5-20250929
+
+    Robustness contract (adversarially verified):
+      - Only the requested Claude family ranks; gpt-*, gemini-*, and the other
+        two Claude families -> None.
+      - A trailing numeric snapshot of 4+ digits (year/YYYYMM/YYYYMMDD/timestamp)
+        is stripped and never read as a version.
+      - The family word must be a whole word (\\bsonnet\\b), so
+        'claude-personnet-4.5' -> None.
+      - model_name is consulted ONLY as a fallback when model_id is itself a Claude
+        id, so a non-Claude whose display name merely mentions 'Claude Sonnet 4.5'
+        (e.g. id='gpt-5') -> None.
+      - A separator-less multi-digit version is read as the MAJOR
+        (claude-sonnet-10 -> (10, 0)), so a future double-digit generation ranks
+        ABOVE every 3.x/4.x instead of collapsing to (1, 0).
+      - Orders 3 < 3.5 < 3.7 < 4 < 4.5 < 4.6 < 5 < 10 ...
+    """
+    other_families = [f for f in _CLAUDE_FAMILIES if f != family]
+    mid = str(model_id or "").strip().lower()
+    # Only trust model_name when the *id* already marks this as a Claude model;
+    # this stops a non-Claude id (e.g. 'gpt-5') borrowing a Claude rank from prose.
+    candidates = [mid]
+    if "claude" in mid:
+        candidates.append(str(model_name or "").strip().lower())
+
+    for s in candidates:
+        if not s:
+            continue
+        if "claude" not in s or not re.search(rf"\b{family}\b", s):
+            continue
+        if any(other in s for other in other_families):
+            continue
+
+        # Strip reasoning-variant suffixes first ...
+        for suf in _REASONING_SUFFIXES:
+            s = s.replace("-" + suf, "").replace("_" + suf, "")
+        # ... then drop a trailing numeric snapshot/date (run of 4+ digits at the
+        # end). Real version parts are 1-3 digits, so this never eats a major/minor.
+        s = re.sub(r"[-_.]?\d{4,}$", "", s)
+
+        # Shape A -- version BEFORE the family word: claude-3.5-sonnet / claude-3-5-haiku
+        m = re.search(rf"claude[-_ ]+v?(\d+(?:[.\-_]\d+)?)[-_ ]+{family}", s)
+        if not m:
+            # Shape B -- version AFTER the family word: claude-sonnet-4 / claude-haiku-4.5
+            m = re.search(rf"{family}[-_ ]+v?(\d+(?:[.\-_]\d+)?)", s)
+        if not m:
+            continue
+
+        token = m.group(1).replace("_", "-")
+        if "." in token:
+            parts = token.split(".")
+        elif "-" in token:
+            parts = token.split("-")
+        else:
+            # Bare digits, no separator -> the WHOLE number is the major (minor 0):
+            # claude-sonnet-4 -> (4,0), -10 -> (10,0). Real Sonnet ids always
+            # separate a minor (4.5 / 4-5), so a lone number is a whole major.
+            parts = [token]
+
+        try:
+            major = int(parts[0])
+            minor = int(parts[1]) if len(parts) > 1 and parts[1] != "" else 0
+        except (ValueError, IndexError):
+            continue
+        return (major, minor)
+    return None
+
+def _sonnet_rank(model_id, model_name=""):
+    return _claude_rank(model_id, model_name, family="sonnet")
+
+def _haiku_rank(model_id, model_name=""):
+    return _claude_rank(model_id, model_name, family="haiku")
+
+# Policy states that mean the signed-in account is NOT entitled to call the model.
+_POLICY_BAD_STATES = {"unconfigured", "not_configured", "disabled", "blocked", "denied"}
+
+def _model_is_available(model_obj):
+    """Decide whether one RAW model object from the Copilot GET /models response
+    (data["data"][i]) is usable by the signed-in account right now.
+
+    MUST be called on the raw object BEFORE it is reduced to {"id","name"} -- the
+    reduced object drops policy/model_picker_enabled/capabilities, so every reduced
+    object would (wrongly) read as available.
+
+    Conservative by design: a signal may only DISQUALIFY a model when it is
+    unambiguously present and negative. Missing / unknown / malformed signals
+    default to "available" so we never hide a model the account can actually use.
+    """
+    if not isinstance(model_obj, dict):
+        return False
+
+    # 1) policy -- present only on opt-in / gated models. Absent => no opt-in
+    #    required => available. Only documented "not entitled" states disqualify.
+    policy = model_obj.get("policy")
+    if isinstance(policy, dict):
+        state = policy.get("state")
+        if isinstance(state, str) and state.strip().lower() in _POLICY_BAD_STATES:
+            return False
+
+    # 2) model_picker_enabled -- only disqualify when EXPLICITLY False.
+    if model_obj.get("model_picker_enabled") is False:
+        return False
+
+    caps = model_obj.get("capabilities")
+    if isinstance(caps, dict):
+        # 3) type -- only disqualify when explicitly a non-chat type (e.g. embeddings).
+        ctype = caps.get("type")
+        if isinstance(ctype, str) and ctype.strip().lower() not in ("chat", ""):
+            return False
+        # 4) tool_calls -- /chat needs it; disqualify only when explicitly False.
+        supports = caps.get("supports")
+        if isinstance(supports, dict) and supports.get("tool_calls") is False:
+            return False
+
+    return True
+
+def _auto_select_default_model():
+    """Set the module global MODEL to the highest-version Claude HAIKU the account
+    can actually use — Haiku answers noticeably faster than Sonnet, and response
+    latency matters more than raw intelligence for the default chat experience.
+    Falls back to the highest Sonnet when the plan has no Haiku, keeping gpt-4o
+    as the final safety net. A persisted manual pick or an explicit GITHUB_MODEL
+    pin always wins. Idempotent (guard flag) and safe to call before auth is
+    ready or the catalog is fetched.
+    """
+    global MODEL, _default_model_selected
+    if _default_model_selected:
+        return
+    # A persisted manual pick or an explicit env pin both lock out auto-selection.
+    if _load_sticky_model() or MODEL_PINNED:
+        _default_model_selected = True
+        return
+    # Wait for a real catalog fetch -- the bootstrap AVAILABLE_MODELS has no
+    # verified "available" flags, so we never auto-pick from a guess.
+    if not _models_fetched:
+        return
+    try:
+        for family in ("haiku", "sonnet"):  # speed first, capability fallback
+            best = None  # ((rank_tuple, is_base), id)
+            for m in AVAILABLE_MODELS:
+                if not m.get("available"):  # only models confirmed usable by the fetch
+                    continue
+                rank = _claude_rank(m.get("id", ""), m.get("name", ""), family=family)
+                if rank is None:
+                    continue
+                mid = str(m.get("id", "")).lower()
+                # Tie-break: prefer the plain base model over a -thought/-thinking variant.
+                is_base = not any(suf in mid for suf in _REASONING_SUFFIXES)
+                key = (rank, is_base)
+                if best is None or key > best[0]:
+                    best = (key, m["id"])
+            if best is not None:
+                MODEL = best[1]
+                _tlog("model.auto_selected", {"model": MODEL, "family": family})
+                break
+        # else: no usable Haiku or Sonnet -> keep gpt-4o (or whatever MODEL already is).
+    except Exception as e:
+        print(f"[brainstem] Auto-select skipped: {e}")
+    _default_model_selected = True
+
+def _fetch_copilot_models():
+    """Fetch available models from Copilot API. Updates AVAILABLE_MODELS in place."""
+    global AVAILABLE_MODELS, _models_fetched, _NO_TOOL_CHOICE_MODELS
+    if _models_fetched:
+        return
+    try:
+        copilot_token, endpoint = get_copilot_token()
+        resp = requests.get(
+            f"{endpoint}/models",
+            headers={
+                "Authorization": f"Bearer {copilot_token}",
+                "Content-Type": "application/json",
+                "Editor-Version": "vscode/1.95.0",
+                "Copilot-Integration-Id": "vscode-chat",
+            },
+            timeout=10,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            models_list = data if isinstance(data, list) else data.get("data", data.get("models", []))
+            if models_list:
+                new_models = []
+                skipped = []
+                for m in models_list:
+                    mid = m.get("id", m.get("model", ""))
+                    mname = m.get("name", mid)
+                    if not mid:
+                        continue
+                    # Skip Copilot's internal utility models that aren't user-pickable
+                    # chat models (e.g. trajectory-compaction).
+                    if mid.lower() == "trajectory-compaction":
+                        skipped.append(mid)
+                        continue
+                    caps = m.get("capabilities", {}) or {}
+                    # Only chat models — embeddings can't be driven via /chat.
+                    if caps.get("type", "chat") != "chat":
+                        skipped.append(mid)
+                        continue
+                    # Only keep models the Copilot API will actually serve over
+                    # /chat/completions. Some listed models (e.g. gpt-5.5,
+                    # *-codex, mai-code-*) are Responses-API-only and reject
+                    # chat/completions with "unsupported_api_for_model". Fail
+                    # OPEN when the field is absent (older API responses omit it)
+                    # so a schema change doesn't wipe the list; a present list
+                    # that lacks /chat/completions (including an empty list)
+                    # means the model has no chat route -> skip it.
+                    endpoints = m.get("supported_endpoints")
+                    if endpoints is not None and "/chat/completions" not in endpoints:
+                        skipped.append(mid)
+                        continue
+                    # Capture availability (policy / model_picker_enabled /
+                    # capabilities) from the RAW object before reducing it.
+                    new_models.append({"id": mid, "name": mname, "available": _model_is_available(m)})
+                    if "o1" in mid.lower():
+                        _NO_TOOL_CHOICE_MODELS.add(mid)
+                if new_models:
+                    AVAILABLE_MODELS = new_models
+                    _models_fetched = True  # latch only on a successful catalog fetch
+    except Exception as e:
+        print(f"[brainstem] Could not fetch models (using defaults): {e}")
+    # Settle the default now that a real catalog (with availability) may exist.
+    # No-op until a successful fetch; never recurses back into this function.
+    _auto_select_default_model()
+
+# ── Flight Recorder (book.json telemetry) ─────────────────────────────────────
+
+_flight_log = []
+_flight_log_lock = threading.Lock()
+_FLIGHT_LOG_MAX = 2000
+_flight_log_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".brainstem_book.json")
+
+def _tlog(event_type, data=None, level="info"):
+    """Append an event to the flight recorder."""
+    entry = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "type": event_type,
+        "level": level,
+    }
+    if data:
+        entry["data"] = data
+    with _flight_log_lock:
+        _flight_log.append(entry)
+        if len(_flight_log) > _FLIGHT_LOG_MAX:
+            _flight_log[:] = _flight_log[-_FLIGHT_LOG_MAX:]
+
+def _tlog_save():
+    """Persist flight log to disk (called periodically and on export)."""
+    try:
+        with _flight_log_lock:
+            snapshot = list(_flight_log)
+        _atomic_write_json(_flight_log_file, snapshot)
+    except Exception:
+        pass
+
+def _tlog_load():
+    """Load previous flight log from disk on startup."""
+    global _flight_log
+    if not os.path.exists(_flight_log_file):
+        return
+    try:
+        with open(_flight_log_file, encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, list):
+            with _flight_log_lock:
+                _flight_log = data[-_FLIGHT_LOG_MAX:]
+    except Exception:
+        pass
+
+def _tlog_autosave():
+    """Background thread: flush flight log to disk every 30s."""
+    while True:
+        time.sleep(30)
+        _tlog_save()
+
+# Start autosave thread
+threading.Thread(target=_tlog_autosave, daemon=True).start()
+
+# ── GitHub token ──────────────────────────────────────────────────────────────
+
+# GitHub Copilot GitHub App client ID — produces ghu_ tokens that work with Copilot exchange API
+# Note: Ov23ctDVkRmgkPke0Mmm is an OAuth App that produces gho_ tokens — those get 404 from Copilot
+COPILOT_CLIENT_ID = "Iv1.b507a08c87ecfe98"
+_token_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".copilot_token")
+_copilot_cache_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".copilot_session")
+
+def _read_token_file():
+    """Read the token file. Returns dict with at least 'access_token', or None."""
+    if not os.path.exists(_token_file):
+        return None
+    try:
+        with open(_token_file, encoding="utf-8") as f:
+            raw = f.read().strip()
+        if not raw:
+            return None
+        # New JSON format: {"access_token": ..., "refresh_token": ...}
+        if raw.startswith("{"):
+            return json.loads(raw)
+        # Legacy plain-text format: just the token string
+        return {"access_token": raw}
+    except Exception:
+        return None
+
+def get_github_token():
+    """Get GitHub token from env, saved file, or gh CLI.
+    
+    Only returns tokens that work with the Copilot token exchange API.
+    Tokens from 'gh auth token' (gho_ prefix) don't have Copilot access,
+    so we skip them and only use ghu_ tokens from our device code flow.
+    """
+    # 1. Env var
+    token = os.getenv("GITHUB_TOKEN", "").strip()
+    if token:
+        return token
+    # 2. Saved token from device code login (ghu_ tokens)
+    data = _read_token_file()
+    if data and data.get("access_token"):
+        return data["access_token"]
+    # 3. gh CLI — only use if it returns a Copilot-compatible token (not gho_)
+    try:
+        env = os.environ.copy()
+        if sys.platform == "win32":
+            # gh may have been installed into a PATH entry that this long-running
+            # process didn't inherit. Rebuild PATH from the registry, but: (1) EXPAND
+            # REG_EXPAND_SZ values — raw reads return literal %SystemRoot%/%USERPROFILE%
+            # that resolve to nothing, dropping the WindowsApps dir where user-scope gh
+            # shims live; (2) APPEND to the current PATH instead of replacing it, so a
+            # session-prepended gh still resolves; (3) collapse to a single case variant
+            # so subprocess reads a deterministic value.
+            try:
+                import winreg
+                parts = [os.environ.get("Path") or os.environ.get("PATH") or ""]
+                with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment") as key:
+                    parts.append(winreg.ExpandEnvironmentStrings(winreg.QueryValueEx(key, "Path")[0]))
+                with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Environment") as key:
+                    parts.append(winreg.ExpandEnvironmentStrings(winreg.QueryValueEx(key, "Path")[0]))
+                env.pop("PATH", None)
+                env["Path"] = ";".join(p for p in parts if p)
+            except Exception:
+                pass
+        result = subprocess.run(
+            ["gh", "auth", "token"],
+            capture_output=True, text=True, timeout=5,
+            shell=(sys.platform == "win32"),
+            env=env,
+        )
+        token = result.stdout.strip()
+        if token and not token.startswith("gho_"):
+            return token
+    except Exception:
+        pass
+    return None
+
+def save_github_token(token, refresh_token=None):
+    """Persist token (and optional refresh token) for reuse across restarts."""
+    # Preserve existing refresh_token if we're only updating the access_token
+    existing = _read_token_file() or {}
+    data = {
+        "access_token": token,
+        "refresh_token": refresh_token or existing.get("refresh_token"),
+        "saved_at": time.time(),
+    }
+    _atomic_write_json(_token_file, data)
+    _tlog("auth.token_saved", {"prefix": token[:4], "has_refresh": bool(refresh_token)})
+    print(f"[brainstem] GitHub token saved (prefix: {token[:4]}...)")
+    # A fresh token may unlock new models — let the next request re-fetch the
+    # catalog and re-run model auto-selection (covers logging in after startup).
+    global _models_fetched, _default_model_selected
+    _models_fetched = False
+    _default_model_selected = False
+    _NO_TOOL_CHOICE_MODELS.clear()
+
+def refresh_github_token():
+    """Try to refresh an expired GitHub token using the stored refresh_token."""
+    data = _read_token_file()
+    if not data or not data.get("refresh_token"):
+        return None
+    try:
+        resp = requests.post(
+            "https://github.com/login/oauth/access_token",
+            headers={"Accept": "application/json", "Content-Type": "application/x-www-form-urlencoded"},
+            data=(
+                f"client_id={COPILOT_CLIENT_ID}"
+                f"&grant_type=refresh_token"
+                f"&refresh_token={data['refresh_token']}"
+            ),
+            timeout=10,
+        )
+        result = resp.json()
+        if result.get("access_token"):
+            new_token = result["access_token"]
+            new_refresh = result.get("refresh_token", data.get("refresh_token"))
+            save_github_token(new_token, new_refresh)
+            print(f"[brainstem] GitHub token refreshed successfully")
+            return new_token
+        print(f"[brainstem] Token refresh failed: {result.get('error', 'unknown')}")
+    except Exception as e:
+        print(f"[brainstem] Token refresh error: {e}")
+    return None
+
+def _load_copilot_cache():
+    """Load cached Copilot API token from disk."""
+    if not os.path.exists(_copilot_cache_file):
+        return None
+    try:
+        with open(_copilot_cache_file, encoding="utf-8") as f:
+            data = json.load(f)
+        if data.get("token") and time.time() < data.get("expires_at", 0) - 60:
+            return data
+    except Exception:
+        pass
+    return None
+
+def _save_copilot_cache(token, endpoint, expires_at):
+    """Cache Copilot API token to disk so it survives restarts."""
+    try:
+        _atomic_write_json(_copilot_cache_file, {"token": token, "endpoint": endpoint, "expires_at": expires_at})
+    except Exception:
+        pass
+
+# ── Copilot token exchange ────────────────────────────────────────────────────
+
+_copilot_token_cache = {"token": None, "endpoint": None, "expires_at": 0}
+# Serializes the token exchange so N concurrent expired-token requests don't all fire
+# the exchange at once (a refresh-token stampede that can burn the single-use refresh
+# token). One thread exchanges; the rest re-read the fresh cache.
+_copilot_token_lock = threading.Lock()
+
+def _invalidate_copilot_token():
+    """Drop the cached Copilot API token (memory + disk) so the next
+    get_copilot_token() performs a fresh exchange. Used when the API rejects the
+    cached token (401) even though its local expiry hadn't elapsed."""
+    global _copilot_token_cache
+    _copilot_token_cache = {"token": None, "endpoint": None, "expires_at": 0}
+    try:
+        if os.path.exists(_copilot_cache_file):
+            os.remove(_copilot_cache_file)
+    except OSError:
+        pass
+
+def _exchange_github_for_copilot(github_token):
+    """Exchange a GitHub token for a Copilot API token. Returns (token, endpoint, expires_at) or raises."""
+    auth_prefix = "token" if github_token.startswith("ghu_") else "Bearer"
+    print(f"[brainstem] Exchanging token (prefix: {github_token[:8]}..., auth: {auth_prefix})")
+    resp = requests.get(
+        COPILOT_TOKEN_URL,
+        headers={
+            "Authorization": f"{auth_prefix} {github_token}",
+            "Accept": "application/json",
+            "Editor-Version": "vscode/1.95.0",
+            "Editor-Plugin-Version": "copilot/1.0.0",
+            "User-Agent": "GitHubCopilotChat/0.22.2024",
+        },
+        timeout=10,
+    )
+    print(f"[brainstem] Exchange response: HTTP {resp.status_code} — {resp.text[:300]}")
+    return resp
+
+def get_copilot_token():
+    """Exchange GitHub token for a short-lived Copilot API token."""
+    global _copilot_token_cache
+
+    # 1. Return in-memory cached token if still valid (with 60s buffer). Lock-free
+    #    fast path — the overwhelming majority of calls hit a warm cache.
+    if _copilot_token_cache["token"] and time.time() < _copilot_token_cache["expires_at"] - 60:
+        return _copilot_token_cache["token"], _copilot_token_cache["endpoint"]
+
+    # Cache is cold/expired: serialize so only one thread does the exchange.
+    with _copilot_token_lock:
+        # Re-check — another thread may have refreshed while we waited for the lock.
+        if _copilot_token_cache["token"] and time.time() < _copilot_token_cache["expires_at"] - 60:
+            return _copilot_token_cache["token"], _copilot_token_cache["endpoint"]
+        return _get_copilot_token_locked()
+
+def _get_copilot_token_locked():
+    """Refresh path for get_copilot_token, always run under _copilot_token_lock."""
+    global _copilot_token_cache
+
+    # 2. Try disk-cached Copilot session token (survives restarts)
+    disk_cache = _load_copilot_cache()
+    if disk_cache:
+        _copilot_token_cache = disk_cache
+        _tlog("auth.copilot_restored", {"expires_in": int(disk_cache['expires_at'] - time.time())})
+        print(f"[brainstem] Copilot token restored from cache (expires in {int(disk_cache['expires_at'] - time.time())}s)")
+        return disk_cache["token"], disk_cache["endpoint"]
+
+    # 3. Exchange GitHub token for Copilot token
+    github_token = get_github_token()
+    if not github_token:
+        _tlog("auth.no_github_token", level="warn")
+        raise RuntimeError("Not authenticated. Visit /login in your browser to sign in with GitHub.")
+    
+    _tlog("auth.copilot_exchange", {"token_prefix": github_token[:4]})
+    resp = _exchange_github_for_copilot(github_token)
+    
+    # 4. If error, the GitHub token may have expired — try refreshing it
+    if resp.status_code in (401, 403, 404):
+        _tlog("auth.copilot_exchange_failed", {"status": resp.status_code, "trying_refresh": True}, level="warn")
+        refreshed = refresh_github_token()
+        if refreshed:
+            resp = _exchange_github_for_copilot(refreshed)
+        if resp.status_code in (401, 403, 404):
+            # Token exchange failed — NEVER delete the token file.
+            try:
+                err_body = resp.json()
+                err_details = err_body.get("error_details", {})
+                notification_id = err_details.get("notification_id", "")
+            except Exception:
+                err_details = {}
+                notification_id = ""
+
+            if notification_id == "no_copilot_access":
+                # Extract username from error message
+                detail_msg = err_details.get("message", "")
+                username = detail_msg.split("as ")[-1].rstrip(".") if "as " in detail_msg else "this account"
+                _tlog("auth.no_copilot_access", {"username": username}, level="error")
+                print(f"[brainstem] No Copilot access for {username}")
+                # Delete the bad token so health check shows unauthenticated
+                if os.path.exists(_token_file):
+                    os.remove(_token_file)
+                raise RuntimeError(
+                    f"NO_COPILOT_ACCESS:{username}"
+                )
+
+            try:
+                err_msg = err_body.get("message", resp.text[:200])
+            except Exception:
+                err_msg = resp.text[:200]
+            _tlog("auth.copilot_exchange_error", {"status": resp.status_code, "error": err_msg[:200]}, level="error")
+            print(f"[brainstem] Copilot token exchange failed (HTTP {resp.status_code}): {err_msg}")
+            raise RuntimeError(
+                f"Copilot auth failed ({resp.status_code}): {err_msg}. Sign in with GitHub to retry."
+            )
+    resp.raise_for_status()
+    
+    data = resp.json()
+    copilot_token = data.get("token")
+    endpoint = data.get("endpoints", {}).get("api", "https://api.individual.githubcopilot.com")
+    expires_at = data.get("expires_at", time.time() + 600)
+    
+    if not copilot_token:
+        _tlog("auth.copilot_no_token", level="error")
+        raise RuntimeError("Failed to get Copilot API token. Check your Copilot subscription.")
+    
+    _copilot_token_cache = {
+        "token": copilot_token,
+        "endpoint": endpoint,
+        "expires_at": expires_at,
+    }
+    _save_copilot_cache(copilot_token, endpoint, expires_at)
+    
+    _tlog("auth.copilot_ready", {"expires_in": int(expires_at - time.time()), "endpoint": endpoint})
+    print(f"[brainstem] Copilot token refreshed (expires in {int(expires_at - time.time())}s)")
+    return copilot_token, endpoint
+
+# ── Device code OAuth flow ────────────────────────────────────────────────────
+
+_pending_login = {}
+_login_bg_thread = None
+_login_result = {}  # Written by bg poll thread, read by /login/poll endpoint
+_pending_login_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".copilot_pending")
+
+def _save_pending_login():
+    """Persist pending device code to disk so it survives server restarts."""
+    try:
+        if _pending_login:
+            _atomic_write_json(_pending_login_file, _pending_login)
+        elif os.path.exists(_pending_login_file):
+            os.remove(_pending_login_file)
+    except Exception:
+        pass
+
+def _load_pending_login():
+    """Load pending device code from disk on startup."""
+    global _pending_login
+    if not os.path.exists(_pending_login_file):
+        return
+    try:
+        with open(_pending_login_file, encoding="utf-8") as f:
+            data = json.load(f)
+        if data.get("device_code") and time.time() < data.get("expires_at", 0):
+            _pending_login = data
+            print(f"[brainstem] Resumed pending device code: {data.get('user_code')} (expires in {int(data['expires_at'] - time.time())}s)")
+            _start_bg_poll()
+        else:
+            # Expired — clean up
+            os.remove(_pending_login_file)
+    except Exception:
+        pass
+
+def start_device_code_login(force_new=False):
+    """Start GitHub device code OAuth flow. Returns user_code and verification_uri.
+    
+    Reuses an existing pending code if it hasn't expired (prevents refresh-kills-auth bug).
+    Set force_new=True to always request a fresh code.
+    """
+    global _pending_login, _login_bg_thread, _login_result, _copilot_token_cache
+
+    # Reuse existing non-expired code (e.g. user refreshed the page)
+    if not force_new and _pending_login and time.time() < _pending_login.get("expires_at", 0):
+        _tlog("login.reuse_code", {"user_code": _pending_login["user_code"], "expires_in": int(_pending_login["expires_at"] - time.time())})
+        print(f"[brainstem] Reusing existing device code (expires in {int(_pending_login['expires_at'] - time.time())}s)")
+        return {
+            "user_code": _pending_login["user_code"],
+            "verification_uri": _pending_login["verification_uri"],
+        }
+
+    # Clear stale state so the new flow starts completely clean
+    _login_result = {}
+    _copilot_token_cache = {"token": None, "endpoint": None, "expires_at": 0}
+    if os.path.exists(_copilot_cache_file):
+        try:
+            os.remove(_copilot_cache_file)
+        except Exception:
+            pass
+
+    resp = requests.post(
+        "https://github.com/login/device/code",
+        headers={"Accept": "application/json", "Content-Type": "application/x-www-form-urlencoded"},
+        data=f"client_id={COPILOT_CLIENT_ID}",
+        timeout=10,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    _pending_login = {
+        "device_code": data["device_code"],
+        "user_code": data["user_code"],
+        "verification_uri": data["verification_uri"],
+        "interval": data.get("interval", 5),
+        "expires_at": time.time() + data.get("expires_in", 900),
+    }
+    _save_pending_login()
+    _tlog("login.device_code_started", {"user_code": data["user_code"]})
+    print(f"[brainstem] Device code login started: {data['user_code']}")
+
+    # Start background polling so token is captured even if browser disconnects
+    _start_bg_poll()
+
+    return {
+        "user_code": data["user_code"],
+        "verification_uri": data["verification_uri"],
+    }
+
+def _start_bg_poll():
+    """Start a background thread that polls GitHub for device code completion."""
+    global _login_bg_thread
+    if _login_bg_thread and _login_bg_thread.is_alive():
+        return  # Already running
+    _login_bg_thread = threading.Thread(target=_bg_poll_loop, daemon=True)
+    _login_bg_thread.start()
+
+def _bg_poll_loop():
+    """Background loop: polls GitHub for the device code token.
+
+    This is the SOLE caller of poll_device_code(). The /login/poll endpoint
+    reads _login_result instead of calling poll_device_code() directly,
+    which eliminates the race condition between bg thread and client poll.
+    """
+    global _login_result
+    while _pending_login:
+        interval = _pending_login.get("interval", 5)
+        time.sleep(interval)
+        if not _pending_login:
+            break
+        try:
+            token = poll_device_code()
+            if token:
+                print(f"[brainstem] Background poll: token acquired (prefix: {token[:4]}...)")
+                # Eagerly exchange for Copilot token
+                try:
+                    get_copilot_token()
+                    print("[brainstem] Copilot session established via background poll")
+                    _login_result = {"status": "ok", "message": "Authenticated with GitHub Copilot!"}
+                except Exception as e:
+                    err = str(e)
+                    if err.startswith("NO_COPILOT_ACCESS:"):
+                        print(f"[brainstem] Background poll: no Copilot access — {err}")
+                        _login_result = {"status": "error", "error": err}
+                    else:
+                        print(f"[brainstem] Eager Copilot exchange deferred: {e}")
+                        _login_result = {"status": "ok", "message": "Authenticated with GitHub Copilot!"}
+                break
+        except RuntimeError as e:
+            print(f"[brainstem] Background poll stopped: {e}")
+            _login_result = {"status": "error", "error": str(e)}
+            break
+        except Exception as e:
+            print(f"[brainstem] Background poll error: {e}")
+            # Keep polling on transient errors
+
+def poll_device_code():
+    """Poll for completed device code authorization. Returns token or None."""
+    global _pending_login
+    if not _pending_login:
+        return None
+
+    if time.time() >= _pending_login.get("expires_at", 0):
+        _pending_login = {}
+        _save_pending_login()
+        _tlog("login.code_expired", level="warn")
+        raise RuntimeError("Login code expired. Please try again.")
+
+    resp = requests.post(
+        "https://github.com/login/oauth/access_token",
+        headers={"Accept": "application/json", "Content-Type": "application/x-www-form-urlencoded"},
+        data=(
+            f"client_id={COPILOT_CLIENT_ID}"
+            f"&device_code={_pending_login['device_code']}"
+            f"&grant_type=urn:ietf:params:oauth:grant-type:device_code"
+        ),
+        timeout=10,
+    )
+    data = resp.json()
+
+    if data.get("access_token"):
+        token = data["access_token"]
+        refresh = data.get("refresh_token")
+        _tlog("login.authorized", {"token_prefix": token[:4], "has_refresh": bool(refresh)})
+        print(f"[brainstem] Device code authorized! Token prefix: {token[:4]}...")
+        save_github_token(token, refresh)
+        _pending_login = {}
+        _save_pending_login()
+        return token
+
+    error = data.get("error", "")
+    if error == "slow_down":
+        _tlog("login.slow_down", level="warn")
+        _pending_login["interval"] = _pending_login.get("interval", 5) + 5
+        return None
+    if error == "authorization_pending":
+        return None  # Keep polling
+    if error == "expired_token":
+        _pending_login = {}
+        _save_pending_login()
+        _tlog("login.expired_token", level="warn")
+        raise RuntimeError("Login code expired. Please try again.")
+    if error:
+        _pending_login = {}
+        _save_pending_login()
+        raise RuntimeError(f"Login failed: {error}")
+
+    return None
+
+# ── Soul loader ───────────────────────────────────────────────────────────────
+
+_soul_cache = None
+
+def load_soul():
+    global _soul_cache
+    if _soul_cache is not None:
+        return _soul_cache
+    if not os.path.exists(SOUL_PATH):
+        # Don't cache the fallback: the user may create soul.md after startup, and the
+        # next request should pick it up without needing a restart.
+        print(f"[brainstem] Warning: soul file not found at {SOUL_PATH}, using default.")
+        return "You are a helpful AI assistant."
+    with open(SOUL_PATH, "r", encoding="utf-8") as f:
+        _soul_cache = f.read().strip()
+    print(f"[brainstem] Soul loaded: {SOUL_PATH}")
+    return _soul_cache
+
+# ── Agent loader ──────────────────────────────────────────────────────────────
+
+
+def _load_agent_from_file(filepath):
+    """Load agent classes from a single .py file. Returns dict of name→instance.
+    Auto-installs missing pip packages and shims cloud deps to local storage."""
+    agents = {}
+    brainstem_dir = os.path.dirname(os.path.abspath(__file__))
+    if brainstem_dir not in sys.path:
+        sys.path.insert(0, brainstem_dir)
+    
+    _register_shims()
+    
+    # Try loading, auto-install missing deps, retry once
+    for attempt in range(2):
+        try:
+            mod_name = f"agent_{os.path.basename(filepath).replace('.', '_')}_{id(filepath)}_{attempt}"
+            spec = importlib.util.spec_from_file_location(mod_name, filepath)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            for attr in dir(mod):
+                cls = getattr(mod, attr)
+                if (
+                    isinstance(cls, type)
+                    and hasattr(cls, "perform")
+                    and attr not in ("BasicAgent", "object")
+                    and not attr.startswith("_")
+                ):
+                    instance = cls()
+                    agents[instance.name] = instance
+            break  # success
+        except ModuleNotFoundError as e:
+            missing = _extract_package_name(e)
+            # Only retry if the install actually succeeds. A package that can't be
+            # installed is remembered (in _auto_install) so we don't re-run pip — a
+            # 60s-timeout subprocess — on every single /chat and /health request.
+            if missing and attempt == 0 and _auto_install(missing):
+                continue  # retry after a successful install
+            print(f"[brainstem] Failed to load {filepath}: {e}")
+            break
+        except Exception as e:
+            print(f"[brainstem] Failed to load {filepath}: {e}")
+            break
+    return agents
+
+
+# ── Shims & auto-install ─────────────────────────────────────────────────────
+
+_shims_registered = False
+
+def _register_shims():
+    """Register local shims for cloud dependencies so agents import them transparently."""
+    global _shims_registered
+    if _shims_registered:
+        return
+    
+    import types
+    brainstem_dir = os.path.dirname(os.path.abspath(__file__))
+    
+    # Shim: agents.basic_agent → local basic_agent
+    try:
+        # Try loading from agents/ subdirectory first, then flat
+        agents_dir = os.path.join(brainstem_dir, "agents")
+        if agents_dir not in sys.path:
+            sys.path.insert(0, agents_dir)
+        from basic_agent import BasicAgent as _BA
+        if "agents" not in sys.modules:
+            agents_mod = types.ModuleType("agents")
+            agents_mod.__path__ = [agents_dir]
+            sys.modules["agents"] = agents_mod
+        if "agents.basic_agent" not in sys.modules:
+            ba_mod = types.ModuleType("agents.basic_agent")
+            ba_mod.BasicAgent = _BA
+            sys.modules["agents.basic_agent"] = ba_mod
+            sys.modules["agents"].basic_agent = ba_mod
+        # Shim: openrappter.agents.basic_agent → same BasicAgent
+        if "openrappter" not in sys.modules:
+            or_mod = types.ModuleType("openrappter")
+            or_mod.__path__ = [brainstem_dir]
+            sys.modules["openrappter"] = or_mod
+        if "openrappter.agents" not in sys.modules:
+            or_agents = types.ModuleType("openrappter.agents")
+            or_agents.__path__ = [agents_dir]
+            or_agents.basic_agent = sys.modules["agents.basic_agent"]
+            sys.modules["openrappter.agents"] = or_agents
+            sys.modules["openrappter"].agents = or_agents
+        if "openrappter.agents.basic_agent" not in sys.modules:
+            sys.modules["openrappter.agents.basic_agent"] = sys.modules["agents.basic_agent"]
+    except ImportError as e:
+        print(f"[brainstem] Warning: Could not load BasicAgent: {e}")
+        pass
+    
+    # Shim: utils.azure_file_storage → local_storage.py
+    from local_storage import AzureFileStorageManager as _LSM
+    if "utils" not in sys.modules:
+        utils_mod = types.ModuleType("utils")
+        utils_mod.__path__ = [os.path.join(brainstem_dir, "utils")]
+        sys.modules["utils"] = utils_mod
+    afs_mod = types.ModuleType("utils.azure_file_storage")
+    afs_mod.AzureFileStorageManager = _LSM
+    sys.modules["utils.azure_file_storage"] = afs_mod
+    if hasattr(sys.modules["utils"], "__path__"):
+        sys.modules["utils"].azure_file_storage = afs_mod
+    
+    # Shim: utils.dynamics_storage → same local storage
+    ds_mod = types.ModuleType("utils.dynamics_storage")
+    ds_mod.DynamicsStorageManager = _LSM
+    sys.modules["utils.dynamics_storage"] = ds_mod
+    
+    # Shim: utils.storage_factory → returns local storage manager
+    sf_mod = types.ModuleType("utils.storage_factory")
+    sf_mod.get_storage_manager = lambda: _LSM()
+    sys.modules["utils.storage_factory"] = sf_mod
+    if hasattr(sys.modules["utils"], "__path__"):
+        sys.modules["utils"].storage_factory = sf_mod
+    
+    _shims_registered = True
+    print("[brainstem] Local storage shims registered")
+
+
+# Map of import names → pip package names
+_PIP_MAP = {
+    "bs4": "beautifulsoup4",
+    "beautifulsoup4": "beautifulsoup4",
+    "PIL": "Pillow",
+    "cv2": "opencv-python",
+    "sklearn": "scikit-learn",
+    "yaml": "pyyaml",
+    "docx": "python-docx",
+    "pptx": "python-pptx",
+    "dotenv": "python-dotenv",
+}
+
+
+def _extract_package_name(error):
+    """Extract the pip-installable package name from a ModuleNotFoundError."""
+    msg = str(error)
+    # "No module named 'bs4'"
+    match = re.search(r"No module named '([^']+)'", msg)
+    if not match:
+        return None
+    mod = match.group(1).split(".")[0]
+    return _PIP_MAP.get(mod, mod)
+
+
+# Packages a prior _auto_install could not install — never retried, so one
+# unresolvable agent import doesn't run pip (a 60s-timeout subprocess) on every request.
+_failed_installs = set()
+
+
+def _auto_install(package):
+    """Auto-install a pip package. Returns True on success. A package that fails is
+    remembered and never retried (returns False immediately next time)."""
+    if package in _failed_installs:
+        return False
+    print(f"[brainstem] Auto-installing dependency: {package}")
+    try:
+        result = subprocess.run(
+            [sys.executable, "-m", "pip", "install", package, "-q"],
+            capture_output=True, text=True, timeout=60,
+        )
+        if result.returncode == 0:
+            print(f"[brainstem] Installed {package}")
+            # Clear import caches so retry works
+            importlib.invalidate_caches()
+            return True
+        print(f"[brainstem] Failed to install {package}: {result.stderr[:200]}")
+    except Exception as e:
+        print(f"[brainstem] Failed to install {package}: {e}")
+    _failed_installs.add(package)
+    return False
+
+def load_agents():
+    agents = {}
+    pattern = os.path.join(AGENTS_PATH, "*_agent.py")
+    files = glob.glob(pattern)
+
+    for filepath in files:
+        loaded = _load_agent_from_file(filepath)
+        for name, instance in loaded.items():
+            agents[name] = instance
+            print(f"[brainstem] Agent loaded: {name}")
+
+    print(f"[brainstem] {len(agents)} agent(s) ready.")
+    return agents
+
+# ── LLM call ─────────────────────────────────────────────────────────────────
+
+def call_copilot(messages, tools=None):
+    """Call the Copilot chat completions API."""
+    copilot_token, endpoint = get_copilot_token()
+    
+    url = f"{endpoint}/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {copilot_token}",
+        "Content-Type": "application/json",
+        "Editor-Version": "vscode/1.95.0",
+        "Copilot-Integration-Id": "vscode-chat",
+    }
+    body = {
+        "model": MODEL,
+        "messages": messages,
+    }
+    if tools:
+        body["tools"] = tools
+        if MODEL not in _NO_TOOL_CHOICE_MODELS:
+            body["tool_choice"] = "auto"
+
+    print(f"[brainstem] API call: model={MODEL}, tools={len(tools) if tools else 0}, tool_choice={body.get('tool_choice', 'NONE')}")
+
+    resp = requests.post(url, headers=headers, json=body, timeout=60)
+
+    # A cached Copilot token can be rejected server-side (401) before its local
+    # expiry elapses — early revocation, clock skew, or a session file carried over
+    # from another account. Invalidate it, exchange a fresh one, and retry ONCE so
+    # /chat self-heals instead of returning the same error for the token's whole
+    # remaining lifetime (~25 min).
+    if resp.status_code == 401:
+        _tlog("api.token_rejected_401", {"model": MODEL}, level="warn")
+        print("[brainstem] Copilot token rejected (401) — refreshing once and retrying")
+        _invalidate_copilot_token()
+        try:
+            copilot_token, endpoint = get_copilot_token()
+            url = f"{endpoint}/chat/completions"
+            headers["Authorization"] = f"Bearer {copilot_token}"
+            resp = requests.post(url, headers=headers, json=body, timeout=60)
+        except Exception as e:
+            print(f"[brainstem] Token refresh after 401 failed: {e}")
+
+    if resp.status_code != 200:
+        error_detail = resp.text[:500] if resp.text else "No details"
+        _tlog("api.error", {"model": MODEL, "status": resp.status_code, "detail": error_detail[:300]}, level="error")
+        print(f"[brainstem] API error {resp.status_code} with model '{MODEL}': {error_detail}")
+        # On 400/429/5xx, cycle through other available models before giving up
+        if resp.status_code in (400, 429, 500, 502, 503):
+            tried = {MODEL}
+            fallback_ids = [m["id"] for m in AVAILABLE_MODELS
+                            if m["id"] != MODEL and m.get("available", True)]
+            # Try the universal gpt-4o safety net first.
+            if _SAFETY_NET_MODEL in fallback_ids:
+                fallback_ids.remove(_SAFETY_NET_MODEL)
+                fallback_ids.insert(0, _SAFETY_NET_MODEL)
+            for fallback_model in fallback_ids:
+                if fallback_model in tried:
+                    continue
+                tried.add(fallback_model)
+                print(f"[brainstem] Retrying with {fallback_model}...")
+                body["model"] = fallback_model
+                if fallback_model in _NO_TOOL_CHOICE_MODELS:
+                    body.pop("tool_choice", None)
+                elif tools and "tool_choice" not in body:
+                    body["tool_choice"] = "auto"
+                resp = requests.post(url, headers=headers, json=body, timeout=60)
+                if resp.status_code == 200:
+                    break
+                print(f"[brainstem] {fallback_model} also failed ({resp.status_code})")
+    resp.raise_for_status()
+    # Copilot's chat endpoint may return JSON without a charset; requests then defaults
+    # text/* responses to ISO-8859-1, decoding UTF-8 emoji/em-dashes as Latin-1 mojibake
+    # (e.g. 🧠 -> "ðŸ§ ", — -> "â€""). Force UTF-8 so resp.json() decodes correctly.
+    resp.encoding = "utf-8"
+    result = resp.json()
+
+    # A 200 with an empty/absent "choices" list (content-filtered prompts, some
+    # error-shaped 200s) would otherwise crash below on choices[0]. Fail with a
+    # descriptive error the /chat handler can surface instead of "list index out of
+    # range".
+    if not result.get("choices"):
+        raise RuntimeError(f"Model '{body['model']}' returned no choices: {json.dumps(result)[:200]}")
+
+    # ── Normalize multi-choice responses ──────────────────────────────────────
+    # Some models (e.g. Claude via Copilot API) split text and tool_calls into
+    # separate choices.  Merge them into a single choice so the rest of the
+    # codebase can treat the response uniformly.
+    choices = result.get("choices", [])
+    if len(choices) > 1:
+        merged = {"role": "assistant", "content": None, "tool_calls": []}
+        for c in choices:
+            m = c.get("message", {})
+            if m.get("content"):
+                merged["content"] = (merged["content"] or "") + m["content"]
+            if m.get("tool_calls"):
+                merged["tool_calls"].extend(m["tool_calls"])
+        if not merged["tool_calls"]:
+            del merged["tool_calls"]
+        fr = "tool_calls" if merged.get("tool_calls") else choices[0].get("finish_reason", "stop")
+        result["choices"] = [{"message": merged, "finish_reason": fr}]
+
+    # Debug logging
+    choice = result.get("choices", [{}])[0]
+    msg = choice.get("message", {})
+    fr = choice.get("finish_reason", "")
+    has_tools = bool(msg.get("tool_calls"))
+    print(f"[brainstem] API response: finish_reason={fr}, has_tool_calls={has_tools}, content_len={len(msg.get('content') or '')}")
+    if has_tools:
+        print(f"[brainstem]   tool_calls: {[tc.get('function',{}).get('name','?') for tc in msg['tool_calls']]}")
+
+    # body["model"] holds whichever model actually produced this 200 — it differs
+    # from MODEL when the fallback loop above had to switch models. Return it so
+    # callers can surface a silent substitution instead of hiding it.
+    return result, body["model"]
+
+# ── Agent execution ───────────────────────────────────────────────────────────
+
+
+def run_tool_calls(tool_calls, agents, session_id=None):
+    results = []
+    logs = []
+    for tc in tool_calls:
+        # Defend against a malformed tool_call object so one bad entry can't KeyError
+        # the whole round after other tools have already run.
+        try:
+            fn_name = tc["function"]["name"]
+            tc_id = tc["id"]
+        except (KeyError, TypeError):
+            logs.append(f"[?] Skipped malformed tool call: {str(tc)[:80]}")
+            continue
+        try:
+            args = json.loads(tc["function"].get("arguments", "{}"))
+            if not isinstance(args, dict):
+                args = {}
+        except Exception:
+            args = {}
+
+        print(f"[brainstem] {fn_name} args: {json.dumps(args)[:200]}")
+
+        agent = agents.get(fn_name)
+        if agent:
+            try:
+                result = agent.perform(**args)
+                logs.append(f"[{fn_name}] {result}")
+            except Exception as e:
+                result = f"Error: {e}"
+                logs.append(f"[{fn_name}] ERROR: {e}")
+        else:
+            result = f"Agent '{fn_name}' not found."
+            logs.append(result)
+
+        results.append({
+            "tool_call_id": tc_id,
+            "role": "tool",
+            "name": fn_name,
+            "content": str(result)
+        })
+    return results, logs
+
+# ── /chat endpoint ────────────────────────────────────────────────────────────
+
+@app.route("/chat", methods=["POST"])
+def chat():
+    # silent=True → malformed JSON yields None (a clean JSON 400 below) instead of
+    # Werkzeug's HTML 400, which the web UI can't parse.
+    data = request.get_json(force=True, silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"error": "Request body must be a JSON object"}), 400
+    user_input = data.get("user_input", "")
+    if not isinstance(user_input, str):
+        return jsonify({"error": "user_input must be a string"}), 400
+    user_input = user_input.strip()
+    history    = data.get("conversation_history", [])
+    if not isinstance(history, list):
+        history = []
+    session_id = data.get("session_id") or str(uuid.uuid4())
+
+    if not user_input:
+        return jsonify({"error": "user_input is required"}), 400
+
+    _tlog("chat.request", {"session_id": session_id, "input_len": len(user_input), "history_len": len(history)})
+
+    try:
+        soul   = load_soul()
+        agents = load_agents()
+        # Build tools per-agent so one agent with malformed metadata is skipped
+        # (and just not offered to the model) instead of 500-ing every /chat request.
+        tools = []
+        for a in agents.values():
+            try:
+                tools.append(a.to_tool())
+            except Exception as e:
+                print(f"[brainstem] Skipping agent with bad metadata ({getattr(a, 'name', '?')}): {e}")
+        tools = tools or None
+
+        # ── Collect system context from any agent that provides it ──
+        extra_context = ""
+        for agent in agents.values():
+            try:
+                ctx = agent.system_context()
+                if ctx:
+                    extra_context += "\n" + ctx
+            except Exception as e:
+                print(f"[brainstem] system_context failed for {agent.name}: {e}")
+
+        system_content = soul + extra_context
+        if VOICE_MODE:
+            system_content += "\n\nIMPORTANT: End every response with |||VOICE||| followed by a concise, conversational version of your answer suitable for text-to-speech. Keep the voice version under 2-3 sentences. The part before |||VOICE||| should be the full formatted response."
+
+        messages = [{"role": "system", "content": system_content}]
+        messages += [m for m in history if m.get("role") in ("user", "assistant", "tool")]
+        messages.append({"role": "user", "content": user_input})
+
+        all_logs = []
+        responded_model = MODEL
+        # Up to 3 tool-call rounds
+        for _ in range(3):
+            response, responded_model = call_copilot(messages, tools=tools)
+            choice   = response["choices"][0]
+            msg      = choice["message"]
+            finish   = choice.get("finish_reason", "")
+            messages.append(msg)
+
+            # Some models use finish_reason "tool_calls", others just include tool_calls in the message
+            if msg.get("tool_calls"):
+                tc_names = [(tc.get("function") or {}).get("name", "?") if isinstance(tc, dict) else "?"
+                            for tc in msg["tool_calls"]]
+                print(f"[brainstem] Tool calls triggered (finish_reason={finish}): {tc_names}")
+                tool_results, logs = run_tool_calls(msg["tool_calls"], agents, session_id=session_id)
+                all_logs.extend(logs)
+                messages.extend(tool_results)
+            else:
+                break
+
+        reply = msg.get("content") or ""
+        # The model can still be asking for tools when the 3-round budget runs out,
+        # leaving reply empty. Make one final completion with no tools so it must
+        # answer in prose using the tool results it already has, rather than the user
+        # getting a blank response.
+        if not reply and msg.get("tool_calls"):
+            try:
+                final_response, responded_model = call_copilot(messages, tools=None)
+                reply = (final_response["choices"][0]["message"].get("content") or "").strip()
+            except Exception as e:
+                print(f"[brainstem] Final tool-less completion failed: {e}")
+            if not reply:
+                reply = ("I couldn't finish that within the available tool steps. "
+                         "Try rephrasing, or breaking it into smaller steps.")
+
+        result = {
+            "response": reply,
+            "session_id": session_id,
+            "agent_logs": "\n".join(all_logs),
+            "voice_mode": VOICE_MODE,
+            # The model that actually answered. Differs from `requested_model`
+            # when call_copilot's fallback loop had to switch models, so clients
+            # can show "answered by X" instead of silently misattributing it.
+            "model": responded_model,
+            "requested_model": MODEL,
+        }
+        
+        if VOICE_MODE and "|||VOICE|||" in reply:
+            parts = reply.split("|||VOICE|||", 1)
+            result["response"] = parts[0].strip()
+            result["voice_response"] = parts[1].strip()
+        
+        return jsonify(result)
+
+    except requests.exceptions.HTTPError as e:
+        traceback.print_exc()
+        status = e.response.status_code if e.response is not None else 502
+        detail = (e.response.text[:300] if e.response is not None else str(e)[:300])
+        _tlog("chat.error", {"model": MODEL, "status": status, "detail": detail[:200]}, level="error")
+        if status == 429 or "quota" in detail.lower():
+            msg = "Copilot usage limit reached — wait a minute and try again."
+        else:
+            msg = f"Model '{MODEL}' returned {status}. All fallback models also failed — try again shortly or switch models."
+        return jsonify({
+            "error": msg,
+            "model": MODEL,
+            "detail": detail
+        }), 502
+
+    except Exception as e:
+        traceback.print_exc()
+        _tlog("chat.error", {"error": str(e)[:200]}, level="error")
+        return jsonify({"error": str(e)}), 500
+
+# ── /health endpoint ──────────────────────────────────────────────────────────
+
+@app.route("/", methods=["GET"])
+def index():
+    return send_from_directory(os.path.dirname(os.path.abspath(__file__)), "index.html")
+
+@app.route("/login", methods=["POST"])
+def login():
+    """Start GitHub device code OAuth flow."""
+    try:
+        data = start_device_code_login()
+        return jsonify(data)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/login/poll", methods=["POST"])
+def login_poll():
+    """Poll for completed device code authorization.
+
+    Reads _login_result (written by the bg poll thread) instead of calling
+    poll_device_code() directly. This eliminates the race where the bg thread
+    and client poll both compete for the same device code response.
+    """
+    # Check if bg thread has completed (or errored)
+    if _login_result:
+        return jsonify(_login_result.copy())
+
+    # Check if code has expired
+    if _pending_login and time.time() >= _pending_login.get("expires_at", 0):
+        return jsonify({"status": "expired", "error": "Login code expired. Please try again."})
+
+    # No pending login at all (e.g., server restarted, or flow was never started)
+    if not _pending_login:
+        return jsonify({"status": "expired", "error": "No login in progress. Please try again."})
+
+    return jsonify({"status": "pending"})
+
+@app.route("/login/status", methods=["GET"])
+def login_status():
+    """Check if a login flow is currently in progress. Returns code info for UI resume."""
+    if _pending_login and time.time() < _pending_login.get("expires_at", 0):
+        return jsonify({
+            "pending": True,
+            "user_code": _pending_login.get("user_code"),
+            "verification_uri": _pending_login.get("verification_uri"),
+            "expires_in": int(_pending_login["expires_at"] - time.time()),
+        })
+    return jsonify({"pending": False})
+
+@app.route("/login/switch", methods=["POST"])
+def login_switch():
+    """Switch GitHub account — clears all cached tokens and starts fresh login."""
+    global _copilot_token_cache, _pending_login, _login_result
+    _tlog("auth.account_switch")
+
+    # Clear everything: memory caches, disk caches, pending login, prior result
+    _copilot_token_cache = {"token": None, "endpoint": None, "expires_at": 0}
+    _pending_login = {}
+    _login_result = {}
+    _save_pending_login()
+
+    for f in (_token_file, _copilot_cache_file):
+        try:
+            if os.path.exists(f):
+                os.remove(f)
+        except Exception:
+            pass
+
+    # Start a fresh device code flow immediately
+    try:
+        data = start_device_code_login(force_new=True)
+        _tlog("auth.switch_new_code", {"user_code": data["user_code"]})
+        return jsonify({"status": "ok", **data})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/models", methods=["GET"])
+def list_models():
+    """List available models and current selection. Fetches from Copilot API on first call."""
+    _fetch_copilot_models()
+    return jsonify({"models": AVAILABLE_MODELS, "current": MODEL})
+
+@app.route("/models/set", methods=["POST"])
+def set_model():
+    """Change the active model. A specific pick is persisted (.brainstem_model) so
+    it stays the default across restarts; "auto" forgets the pick and re-selects
+    the fastest available Claude (highest Haiku, falling back to Sonnet)."""
+    global MODEL, _default_model_selected
+    data = request.get_json(force=True) or {}
+    new_model = data.get("model", "").strip()
+    _fetch_copilot_models()
+    if new_model.lower() == "auto":
+        _clear_sticky_model()
+        _default_model_selected = False
+        _auto_select_default_model()
+        return jsonify({"model": MODEL, "auto": True})
+    valid_ids = [m["id"] for m in AVAILABLE_MODELS]
+    if new_model not in valid_ids:
+        return jsonify({"error": f"Unknown model. Available: {valid_ids}"}), 400
+    MODEL = new_model
+    _save_sticky_model(new_model)     # remember across refresh + restart
+    _default_model_selected = True    # a manual pick disables auto-select this run
+    return jsonify({"model": MODEL})
+
+@app.route("/voice", methods=["GET"])
+def voice_status():
+    """Get voice mode status."""
+    return jsonify({"voice_mode": VOICE_MODE})
+
+@app.route("/voice/config", methods=["GET"])
+def voice_config():
+    """Serve voice config from password-protected voice.zip."""
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    voice_zip = os.path.join(base_dir, "voice.zip")
+    password = request.args.get("password", "").encode() or VOICE_ZIP_PW
+    if os.path.exists(voice_zip):
+        try:
+            import pyzipper
+            with pyzipper.AESZipFile(voice_zip, 'r') as zf:
+                with zf.open("voice.json", pwd=password) as f:
+                    cfg = json.load(f)
+            return jsonify(cfg)
+        except (RuntimeError, Exception) as e:
+            err = str(e).lower()
+            if "password" in err or "bad password" in err or "decrypt" in err:
+                # Fallback: try standard zipfile (for unencrypted legacy zips)
+                try:
+                    import zipfile
+                    with zipfile.ZipFile(voice_zip, 'r') as zf:
+                        with zf.open("voice.json") as f:
+                            cfg = json.load(f)
+                    return jsonify(cfg)
+                except Exception:
+                    return jsonify({"error": "voice.zip password incorrect"}), 403
+            return jsonify({"error": str(e)}), 500
+    return jsonify({})
+
+@app.route("/voice/config", methods=["POST"])
+def voice_config_save():
+    """Save voice config to AES-encrypted voice.zip for local persistence."""
+    data = request.get_json(force=True) or {}
+    password = data.pop("_password", None)
+    if not password:
+        return jsonify({"error": "Password required to export voice.zip"}), 400
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    voice_zip = os.path.join(base_dir, "voice.zip")
+    try:
+        import pyzipper
+        with pyzipper.AESZipFile(voice_zip, 'w',
+                                 compression=pyzipper.ZIP_DEFLATED,
+                                 encryption=pyzipper.WZ_AES) as zf:
+            zf.setpassword(password.encode())
+            zf.writestr("voice.json", json.dumps(data, indent=2))
+        return jsonify({"status": "ok", "message": "voice.zip saved (AES encrypted)"})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/voice/export", methods=["POST"])
+def voice_export():
+    """Generate and return a password-protected voice.zip for download."""
+    data = request.get_json(force=True) or {}
+    password = data.pop("_password", None)
+    if not password:
+        return jsonify({"error": "Password required"}), 400
+    try:
+        import pyzipper
+        import io
+        buf = io.BytesIO()
+        with pyzipper.AESZipFile(buf, 'w',
+                                 compression=pyzipper.ZIP_DEFLATED,
+                                 encryption=pyzipper.WZ_AES) as zf:
+            zf.setpassword(password.encode())
+            zf.writestr("voice.json", json.dumps(data, indent=2))
+        buf.seek(0)
+        from flask import send_file
+        return send_file(buf, mimetype='application/zip',
+                         as_attachment=True, download_name='voice.zip')
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/voice/import", methods=["POST"])
+def voice_import():
+    """Import a password-protected voice.zip and return its config."""
+    if 'file' not in request.files:
+        return jsonify({"error": "No file uploaded"}), 400
+    password = request.form.get("password", "").encode()
+    if not password:
+        return jsonify({"error": "Password required"}), 400
+    f = request.files['file']
+    try:
+        import pyzipper
+        import io
+        buf = io.BytesIO(f.read())
+        with pyzipper.AESZipFile(buf, 'r') as zf:
+            with zf.open("voice.json", pwd=password) as jf:
+                cfg = json.load(jf)
+        # Also save to local voice.zip
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        voice_zip = os.path.join(base_dir, "voice.zip")
+        buf.seek(0)
+        with open(voice_zip, 'wb') as out:
+            out.write(buf.read())
+        return jsonify(cfg)
+    except (RuntimeError, Exception) as e:
+        err = str(e).lower()
+        if "password" in err or "decrypt" in err:
+            return jsonify({"error": "Wrong password"}), 403
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/voice/toggle", methods=["POST"])
+def voice_toggle():
+    """Toggle voice mode on/off."""
+    global VOICE_MODE
+    data = request.get_json(force=True) or {}
+    if "enabled" in data:
+        VOICE_MODE = bool(data["enabled"])
+    else:
+        VOICE_MODE = not VOICE_MODE
+    return jsonify({"voice_mode": VOICE_MODE})
+
+@app.route("/version", methods=["GET"])
+def version():
+    """Return the current brainstem version."""
+    return jsonify({"version": VERSION})
+
+@app.route("/agents", methods=["GET"])
+def list_agents_files():
+    """List all agent .py files available with their loaded agent names."""
+    files = glob.glob(os.path.join(AGENTS_PATH, "*.py"))
+    results = []
+    for f in files:
+        filename = os.path.basename(f)
+        if filename.startswith("__") or not filename.endswith(".py"):
+            continue
+        try:
+            # We don't want to re-download pip packages or run arbitrary init unnecessarily,
+            # but if it's already synthetically loaded or safe to parse, _load_agent_from_file is okay.
+            loaded = _load_agent_from_file(f)
+            agent_names = list(loaded.keys())
+        except Exception:
+            agent_names = []
+            
+        results.append({
+            "filename": filename,
+            "agents": agent_names
+        })
+        
+    return jsonify({"files": results})
+
+@app.route("/agents/export/<filename>", methods=["GET"])
+def agents_export(filename):
+    """Export an agent .py file."""
+    from flask import send_file
+    import werkzeug.utils
+    safe_name = werkzeug.utils.secure_filename(filename)
+    if not safe_name.endswith('.py'):
+        safe_name += '.py'
+    filepath = os.path.join(AGENTS_PATH, safe_name)
+    if os.path.exists(filepath):
+        return send_file(filepath, as_attachment=True)
+    return jsonify({"error": "Agent not found"}), 404
+
+@app.route("/agents/<filename>", methods=["DELETE"])
+def agents_delete(filename):
+    """Delete an agent .py file."""
+    import werkzeug.utils
+    safe_name = werkzeug.utils.secure_filename(filename)
+    if not safe_name.endswith('.py'):
+        safe_name += '.py'
+    # basic_agent.py is the shared base class every agent imports — deleting it breaks
+    # all of them. It isn't a usable agent and the UI never lists it, so refuse.
+    if safe_name == "basic_agent.py":
+        return jsonify({"error": "basic_agent.py is the shared base class and cannot be deleted."}), 400
+    filepath = os.path.join(AGENTS_PATH, safe_name)
+    if os.path.exists(filepath):
+        os.remove(filepath)
+        # Reload agents so memory drops it
+        try:
+            load_agents()
+        except Exception:
+            pass
+        return jsonify({"status": "ok", "message": f"Agent {safe_name} deleted."})
+    return jsonify({"error": "Agent not found"}), 404
+
+@app.route("/agents/import", methods=["POST"])
+def agents_import():
+    """Import an agent .py file via drag & drop."""
+    import werkzeug.utils
+    if 'file' not in request.files:
+        return jsonify({"error": "No file uploaded"}), 400
+    f = request.files['file']
+    if f.filename == '':
+        return jsonify({"error": "No selected file"}), 400
+    if not f.filename.endswith('.py'):
+        return jsonify({"error": "Only .py files are supported"}), 400
+    
+    os.makedirs(AGENTS_PATH, exist_ok=True)
+    safe_name = werkzeug.utils.secure_filename(f.filename)
+    # Ensure it matches the glob pattern *_agent.py
+    if not safe_name.endswith('_agent.py'):
+        safe_name = safe_name[:-3] + '_agent.py'
+        
+    filepath = os.path.join(AGENTS_PATH, safe_name)
+    f.save(filepath)
+
+    # load_agents() swallows per-file errors (returns {} for a broken file), so it
+    # can't tell us whether THIS upload actually works. Load just this file and report
+    # honestly. The file is kept either way — agents/ is the user's workspace, and a
+    # broken file still needs to appear in the list so it can be removed.
+    try:
+        loaded = _load_agent_from_file(filepath)
+    except Exception as e:
+        loaded = {}
+        print(f"[brainstem] Imported {safe_name} but it failed to load: {e}")
+    if not loaded:
+        return jsonify({"error": f"Saved {safe_name}, but it did not load as an agent — check the file for errors."}), 200
+
+    return jsonify({"status": "ok", "message": f"Agent {safe_name} imported successfully."})
+
+@app.route("/health", methods=["GET"])
+def health():
+    agents = {}
+    try:
+        agents = load_agents()
+    except Exception:
+        pass
+    soul_ok = os.path.exists(SOUL_PATH)
+
+    # Lightweight auth check — just see if a GitHub token EXISTS.
+    # Never do token exchange here; that happens lazily on first /chat call.
+    github_token = get_github_token()
+
+    # Check if we have a cached (valid) Copilot session (memory or disk)
+    copilot_ok = False
+    if _copilot_token_cache["token"] and time.time() < _copilot_token_cache["expires_at"] - 60:
+        copilot_ok = True
+    else:
+        disk_cache = _load_copilot_cache()
+        if disk_cache:
+            copilot_ok = True
+
+    if github_token:
+        return jsonify({
+            "status": "ok",
+            "version": VERSION,
+            "model":  MODEL,
+            "voice_mode": VOICE_MODE,
+            "soul":   SOUL_PATH if soul_ok else "missing",
+            "agents": list(agents.keys()),
+            "copilot": "\u2713" if copilot_ok else "pending",
+            "brainstem_dir": os.path.dirname(os.path.abspath(__file__)),
+        })
+    else:
+        return jsonify({
+            "status": "unauthenticated",
+            "version": VERSION,
+            "model":  MODEL,
+            "soul":   SOUL_PATH if soul_ok else "missing",
+            "agents": list(agents.keys()),
+        })
+
+@app.route("/debug/auth", methods=["GET"])
+def debug_auth():
+    """Debug endpoint — shows current auth state and tests token exchange."""
+    token = get_github_token()
+    token_data = _read_token_file()
+    copilot_cache = _load_copilot_cache()
+
+    result = {
+        "github_token_exists": token is not None,
+        "github_token_prefix": token[:10] + "..." if token else None,
+        "github_token_length": len(token) if token else 0,
+        "token_file_exists": os.path.exists(_token_file),
+        "token_file_has_refresh": bool(token_data and token_data.get("refresh_token")),
+        "copilot_cache_exists": copilot_cache is not None,
+        "copilot_cache_expires_in": int(copilot_cache["expires_at"] - time.time()) if copilot_cache else None,
+        "copilot_memory_cache": bool(_copilot_token_cache["token"]),
+    }
+
+    if token:
+        try:
+            resp = _exchange_github_for_copilot(token)
+            result["exchange_http_status"] = resp.status_code
+            result["exchange_response"] = resp.text[:500]
+        except Exception as e:
+            result["exchange_error"] = str(e)
+
+    return jsonify(result)
+
+# ── Diagnostics / Flight Recorder (book.json) ─────────────────────────────────
+
+@app.route("/diagnostics", methods=["GET"])
+def diagnostics():
+    """Return the flight recorder log as JSON. Add ?tail=N for last N events."""
+    tail = request.args.get("tail", type=int)
+    with _flight_log_lock:
+        events = list(_flight_log)
+    if tail:
+        events = events[-tail:]
+    return jsonify({
+        "version": VERSION,
+        "model": MODEL,
+        "uptime_events": len(events),
+        "events": events,
+    })
+
+@app.route("/diagnostics/book.json", methods=["GET"])
+def diagnostics_export():
+    """Export full flight recorder as book.json — the brainstem's story."""
+    _tlog_save()  # Flush to disk first
+    with _flight_log_lock:
+        events = list(_flight_log)
+
+    # Build the book
+    github_token = get_github_token()
+    book = {
+        "title": "RAPP Brainstem Flight Recorder",
+        "exported_at": datetime.now(timezone.utc).isoformat(),
+        "version": VERSION,
+        "config": {
+            "model": MODEL,
+            "soul_path": SOUL_PATH,
+            "agents_path": AGENTS_PATH,
+            "port": PORT,
+            "voice_mode": VOICE_MODE,
+        },
+        "auth_state": {
+            "github_token_exists": github_token is not None,
+            "github_token_prefix": github_token[:4] + "..." if github_token else None,
+            "token_file_exists": os.path.exists(_token_file),
+            "copilot_cache_valid": bool(_copilot_token_cache["token"] and time.time() < _copilot_token_cache["expires_at"] - 60),
+            "pending_login": bool(_pending_login),
+        },
+        "agents_loaded": list(load_agents().keys()),
+        "events": events,
+    }
+
+    from flask import Response
+    return Response(
+        json.dumps(book, indent=2),
+        mimetype="application/json",
+        headers={"Content-Disposition": "attachment; filename=share-with-admin--this-file-tells-your-whole-story--they-can-help-you-now.json"},
+    )
+
+@app.route("/diagnostics/clear", methods=["POST"])
+def diagnostics_clear():
+    """Clear the flight recorder."""
+    with _flight_log_lock:
+        _flight_log.clear()
+    _tlog_save()
+    return jsonify({"status": "ok", "message": "Flight recorder cleared."})
+
+@app.route("/diagnostics/report", methods=["POST"])
+def diagnostics_report():
+    """Create a GitHub issue with session diagnostics so admin can help."""
+    _tlog("diagnostics.report_started")
+    github_token = get_github_token()
+    if not github_token:
+        return jsonify({"error": "Not authenticated — sign in first to submit a report."}), 401
+
+    data = request.get_json(force=True) or {}
+    user_description = data.get("description", "").strip() or "_No description provided_"
+    client_events = data.get("client_events", [])
+
+    # Build the diagnostics snapshot
+    _tlog_save()
+    with _flight_log_lock:
+        events = list(_flight_log)
+
+    # Extract recent errors/warnings for summary
+    err_events = [e for e in events if e.get("level") in ("error", "warn")][-10:]
+    summary_lines = []
+    for e in err_events:
+        d = e.get("data", {})
+        summary_lines.append(f"- `{e['ts']}` **{e['type']}** {json.dumps(d) if d else ''}")
+    error_summary = "\n".join(summary_lines) if summary_lines else "_No errors or warnings recorded_"
+
+    # Scrub sensitive fields from events before publishing
+    _SCRUB_KEYS = {"user_code", "device_code", "session_id"}
+    def _scrub_event(ev):
+        ev = dict(ev)
+        if ev.get("data"):
+            ev["data"] = {k: v for k, v in ev["data"].items() if k not in _SCRUB_KEYS}
+        return ev
+    events = [_scrub_event(e) for e in events]
+    client_events = [_scrub_event(e) for e in client_events]
+
+    # Build compact book (no secrets, capped size)
+    book = {
+        "version": VERSION,
+        "model": MODEL,
+        "auth_state": {
+            "github_token_exists": True,
+            "token_prefix": github_token[:4] + "...",
+            "copilot_cache_valid": bool(_copilot_token_cache["token"] and time.time() < _copilot_token_cache["expires_at"] - 60),
+            "pending_login": bool(_pending_login),
+        },
+        "agents_loaded": list(load_agents().keys()),
+        "server_events": events[-50:],  # Last 50 server events
+        "client_events": client_events[-50:] if client_events else [],
+    }
+    book_json = json.dumps(book, indent=2)
+    # GitHub issues have a body limit ~65536 chars; trim if needed
+    if len(book_json) > 40000:
+        book["server_events"] = events[-20:]
+        book["client_events"] = client_events[-20:] if client_events else []
+        book_json = json.dumps(book, indent=2)
+
+    issue_body = (
+        f"## User Report\n\n{user_description}\n\n"
+        f"## Environment\n\n"
+        f"- **Version:** {VERSION}\n"
+        f"- **Model:** {MODEL}\n"
+        f"- **Agents:** {', '.join(book['agents_loaded']) or 'none'}\n\n"
+        f"## Recent Warnings & Errors\n\n{error_summary}\n\n"
+        f"## Session Diagnostics\n\n"
+        f"<details><summary>book.json (click to expand)</summary>\n\n"
+        f"```json\n{book_json}\n```\n\n</details>"
+    )
+
+    try:
+        resp = requests.post(
+            "https://api.github.com/repos/kody-w/rapp-installer/issues",
+            headers={
+                "Authorization": f"Bearer {github_token}",
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28",
+            },
+            json={
+                "title": f"🆘 Help request — v{VERSION}",
+                "body": issue_body,
+                "labels": [],
+            },
+            timeout=15,
+        )
+        if resp.status_code in (201, 200):
+            issue_data = resp.json()
+            issue_url = issue_data.get("html_url", "")
+            _tlog("diagnostics.report_created", {"issue_url": issue_url})
+            return jsonify({"status": "ok", "issue_url": issue_url})
+
+        # ghu_ tokens from device code don't have repo scope — try gh CLI
+        if resp.status_code in (403, 404):
+            _tlog("diagnostics.report_api_403_trying_cli", level="warn")
+            try:
+                result = subprocess.run(
+                    ["gh", "issue", "create",
+                     "--repo", "kody-w/rapp-installer",
+                     "--title", f"🆘 Help request — v{VERSION}",
+                     "--body", issue_body],
+                    capture_output=True, text=True, timeout=30,
+                )
+                if result.returncode == 0:
+                    issue_url = result.stdout.strip()
+                    _tlog("diagnostics.report_created_via_cli", {"issue_url": issue_url})
+                    return jsonify({"status": "ok", "issue_url": issue_url})
+                _tlog("diagnostics.report_cli_failed", {"stderr": result.stderr[:200]}, level="error")
+            except Exception as cli_err:
+                _tlog("diagnostics.report_cli_error", {"error": str(cli_err)}, level="error")
+
+        err = resp.text[:300]
+        _tlog("diagnostics.report_failed", {"status": resp.status_code, "error": err}, level="error")
+        return jsonify({"error": f"GitHub API returned {resp.status_code}: {err}"}), resp.status_code
+    except Exception as e:
+        _tlog("diagnostics.report_error", {"error": str(e)}, level="error")
+        return jsonify({"error": str(e)}), 500
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    _tlog_load()  # Restore previous flight log
+    _tlog("server.starting", {"version": VERSION, "model": MODEL, "port": PORT})
+    print(f"\n🧠 RAPP Brainstem v{VERSION} starting on http://localhost:{PORT}")
+    # If auth is already available (gh CLI / env / cached token), fetch the real
+    # catalog now so MODEL reflects the auto-selected Haiku in the banner below.
+    # get_copilot_token() is non-interactive here (raises instead of prompting),
+    # so this never blocks startup.
+    try:
+        _fetch_copilot_models()
+    except Exception:
+        pass
+    _auto_select_default_model()
+    print(f"   Soul:   {SOUL_PATH}")
+    print(f"   Agents: {AGENTS_PATH}")
+    print(f"   Model:  {MODEL}")
+    print(f"   Voice:  {'on' if VOICE_MODE else 'off'} (POST /voice/toggle to change)")
+    print(f"   Auth:   GitHub Copilot API (via gh CLI)\n")
+    load_soul()
+    agents = load_agents()
+    _tlog("server.agents_loaded", {"agents": list(agents.keys())})
+    _load_pending_login()  # Resume any in-progress device code login
+    _tlog("server.ready", {"url": f"http://localhost:{PORT}"})
+
+    # HTTPServer.server_bind reverse-DNS-resolves the bind address between bind()
+    # and listen(); on networks whose resolver drops those queries this stalls
+    # startup ~30s with the port bound but not yet accepting, so the installer's
+    # browser tab opens onto a dead port (#14). The looked-up name is only the
+    # WSGI SERVER_NAME default — the bind address itself works fine.
+    import http.server
+    import socketserver
+
+    def _server_bind_no_rdns(self):
+        socketserver.TCPServer.server_bind(self)
+        host, port = self.server_address[:2]
+        self.server_name = host
+        self.server_port = port
+
+    http.server.HTTPServer.server_bind = _server_bind_no_rdns
+
+    app.run(host="0.0.0.0", port=PORT, debug=False)
