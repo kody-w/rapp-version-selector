@@ -9,7 +9,7 @@
     "v0.6.6": {
       "source_commit": "cc699cd",
       "mirrored_at": "2026-07-07T23:14:53Z",
-      "notes": ""
+      "notes": "CI guard for stale docs/ Pages mirrors (#19), Haiku doc-drift fix in /models/set (#20); includes #18 docs/install.ps1 mirror"
     }
   }
 }
