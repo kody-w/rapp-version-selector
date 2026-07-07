@@ -1,0 +1,10 @@
+{
+  "latest": "v0.6.5",
+  "versions": {
+    "v0.6.5": {
+      "source_commit": "5d40873",
+      "mirrored_at": "2026-07-07T22:55:00Z",
+      "notes": "startup rDNS stall fix (#14), race-free browser open, connected-bias status pill, Haiku-first default model"
+    }
+  }
+}
