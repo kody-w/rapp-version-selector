@@ -1,5 +1,9 @@
 # rapp-version-selector
 
+<!-- rapp1:network-header:start -->
+[![RAPP/1](https://kody-w.github.io/rapp-hive-public/portfolio/badges/rapp-version-selector.svg)](https://github.com/kody-w/rapp-hive-public/blob/main/portfolio/repos/rapp-version-selector.md) · **New to RAPP?** [Start here: get your Brainstem →](https://github.com/kody-w/rapp-installer#start-here)
+<!-- rapp1:network-header:end -->
+
 Pin any device to a **specific version** of the [RAPP Brainstem](https://github.com/kody-w/rapp-installer),
 and a permanent mirror of every release going forward (starting at v0.6.5 —
 not retroactive). Mirrors are immutable and survive anything that happens to
